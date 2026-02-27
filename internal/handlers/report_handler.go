@@ -1,140 +1,206 @@
 package handlers
 
 import (
-	"casheer-report-service/internal/models"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/mubarok-ridho/casheer-report-service/internal/models"
+	"github.com/mubarok-ridho/casheer-report-service/internal/repository"
+	"github.com/mubarok-ridho/casheer-report-service/pkg/messaging"
 	"gorm.io/gorm"
 )
 
 type ReportHandler struct {
-	DB *gorm.DB
+	db         *gorm.DB
+	reportRepo *repository.ReportRepository
 }
 
 func NewReportHandler(db *gorm.DB) *ReportHandler {
-	return &ReportHandler{DB: db}
+	return &ReportHandler{
+		db:         db,
+		reportRepo: repository.NewReportRepository(db),
+	}
 }
 
-// Get daily report
+// HandleOrderCompleted - dipanggil dari RabbitMQ consumer
+func (h *ReportHandler) HandleOrderCompleted(event messaging.OrderCompletedEvent) {
+	date, _ := time.Parse("2006-01-02", event.Date)
+
+	// Update atau create revenue
+	var revenue models.Revenue
+	result := h.db.Where("tenant_id = ? AND date = ?", event.TenantID, date).First(&revenue)
+
+	if result.Error != nil {
+		// Create new
+		revenue = models.Revenue{
+			TenantID:     event.TenantID,
+			Date:         date,
+			TotalRevenue: event.TotalAmount,
+			TotalExpense: 0,
+			NetRevenue:   event.TotalAmount,
+			OrderCount:   1,
+			ExpenseCount: 0,
+		}
+		h.db.Create(&revenue)
+	} else {
+		// Update existing
+		revenue.TotalRevenue += event.TotalAmount
+		revenue.NetRevenue = revenue.TotalRevenue - revenue.TotalExpense
+		revenue.OrderCount += 1
+		h.db.Save(&revenue)
+	}
+
+	// Record event
+	h.db.Create(&models.RevenueEvent{
+		TenantID:    event.TenantID,
+		Type:        "order",
+		ReferenceID: event.OrderID,
+		Amount:      event.TotalAmount,
+		Date:        date,
+	})
+
+	// Update daily report
+	h.updateDailyReport(event.TenantID, date)
+}
+
+// GetDailyReport
 func (h *ReportHandler) GetDailyReport(c *fiber.Ctx) error {
 	tenantID := c.Locals("tenant_id").(uint)
 
 	dateStr := c.Query("date")
 	var date time.Time
+	var err error
 
 	if dateStr == "" {
 		date = time.Now()
 	} else {
-		date, _ = time.Parse("2006-01-02", dateStr)
-	}
-
-	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
-	endOfDay := startOfDay.Add(24 * time.Hour)
-
-	// Get total revenue from orders (via API call ke menu service atau event)
-	// Untuk contoh, kita hitung dari tabel revenue yang sudah di-populate via event
-
-	var revenue models.Revenue
-	result := h.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).First(&revenue)
-
-	if result.Error != nil {
-		// Jika belum ada, hitung manual atau return 0
-		revenue = models.Revenue{
-			TenantID:     tenantID,
-			Date:         startOfDay,
-			TotalRevenue: 0,
-			TotalExpense: 0,
-			NetRevenue:   0,
+		date, err = time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid date format. Use YYYY-MM-DD"})
 		}
 	}
 
-	// Get expenses hari ini
-	var expenses []models.Expense
-	h.DB.Where("tenant_id = ? AND date BETWEEN ? AND ?", tenantID, startOfDay, endOfDay).
-		Find(&expenses)
-
-	return c.JSON(fiber.Map{
-		"date":     date.Format("2006-01-02"),
-		"revenue":  revenue,
-		"expenses": expenses,
-	})
-}
-
-// Add expense
-func (h *ReportHandler) AddExpense(c *fiber.Ctx) error {
-	tenantID := c.Locals("tenant_id").(uint)
-
-	var input struct {
-		Category    string  `json:"category"`
-		Description string  `json:"description"`
-		Amount      float64 `json:"amount"`
-		Date        string  `json:"date"`
-	}
-
-	if err := c.BodyParser(&input); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "Invalid input"})
-	}
-
-	date, err := time.Parse("2006-01-02", input.Date)
+	report, err := h.reportRepo.GetDailyReport(tenantID, date)
 	if err != nil {
-		date = time.Now()
-	}
-
-	expense := models.Expense{
-		TenantID:    tenantID,
-		Category:    input.Category,
-		Description: input.Description,
-		Amount:      input.Amount,
-		Date:        date,
-	}
-
-	if err := h.DB.Create(&expense).Error; err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Update atau buat revenue record untuk hari tersebut
-	h.updateRevenue(tenantID, date)
-
-	return c.Status(201).JSON(expense)
+	return c.JSON(report)
 }
 
-// Update revenue (dipanggil setelah ada order atau expense baru)
-func (h *ReportHandler) updateRevenue(tenantID uint, date time.Time) {
+// GetMonthlyReport
+func (h *ReportHandler) GetMonthlyReport(c *fiber.Ctx) error {
+	tenantID := c.Locals("tenant_id").(uint)
+
+	monthStr := c.Query("month")
+	yearStr := c.Query("year")
+
+	month, _ := strconv.Atoi(monthStr)
+	year, _ := strconv.Atoi(yearStr)
+
+	if month == 0 {
+		month = int(time.Now().Month())
+	}
+	if year == 0 {
+		year = time.Now().Year()
+	}
+
+	report, err := h.reportRepo.GetMonthlyReport(tenantID, month, year)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(report)
+}
+
+// GetYearlyReport
+func (h *ReportHandler) GetYearlyReport(c *fiber.Ctx) error {
+	tenantID := c.Locals("tenant_id").(uint)
+
+	yearStr := c.Query("year")
+	year, _ := strconv.Atoi(yearStr)
+	if year == 0 {
+		year = time.Now().Year()
+	}
+
+	report, err := h.reportRepo.GetYearlyReport(tenantID, year)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(report)
+}
+
+// GetRevenueSummary
+func (h *ReportHandler) GetRevenueSummary(c *fiber.Ctx) error {
+	tenantID := c.Locals("tenant_id").(uint)
+
+	days := c.QueryInt("days", 30)
+
+	summary, err := h.reportRepo.GetRevenueSummary(tenantID, days)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(summary)
+}
+
+// GetExpenseSummary
+func (h *ReportHandler) GetExpenseSummary(c *fiber.Ctx) error {
+	tenantID := c.Locals("tenant_id").(uint)
+
+	days := c.QueryInt("days", 30)
+
+	summary, err := h.reportRepo.GetExpenseSummary(tenantID, days)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(summary)
+}
+
+// updateDailyReport - internal function
+func (h *ReportHandler) updateDailyReport(tenantID uint, date time.Time) {
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+	endOfDay := startOfDay.Add(24 * time.Hour)
 
-	// Hitung total revenue dari orders (via event table atau langsung panggil menu service)
-	// Untuk contoh, kita pakai aggregate dari tabel revenue_events
-
+	// Hitung total orders dan revenue
 	var totalRevenue float64
-	h.DB.Table("revenue_events").
-		Where("tenant_id = ? AND date = ? AND type = 'order'", tenantID, startOfDay).
-		Select("COALESCE(SUM(amount), 0)").
-		Scan(&totalRevenue)
+	var orderCount int64
+	h.db.Model(&models.RevenueEvent{}).
+		Where("tenant_id = ? AND type = 'order' AND date BETWEEN ? AND ?",
+			tenantID, startOfDay, endOfDay).
+		Select("COALESCE(SUM(amount), 0), COUNT(*)").
+		Row().Scan(&totalRevenue, &orderCount)
 
+	// Hitung total expenses
 	var totalExpense float64
-	h.DB.Model(&models.Expense{}).
-		Where("tenant_id = ? AND date = ?", tenantID, startOfDay).
-		Select("COALESCE(SUM(amount), 0)").
-		Scan(&totalExpense)
+	var expenseCount int64
+	h.db.Model(&models.Expense{}).
+		Where("tenant_id = ? AND date BETWEEN ? AND ?", tenantID, startOfDay, endOfDay).
+		Select("COALESCE(SUM(amount), 0), COUNT(*)").
+		Row().Scan(&totalExpense, &expenseCount)
 
-	// Upsert revenue
-	var revenue models.Revenue
-	result := h.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).First(&revenue)
+	// Update atau create daily report
+	var report models.DailyReport
+	result := h.db.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).First(&report)
 
 	if result.Error != nil {
-		revenue = models.Revenue{
-			TenantID:     tenantID,
-			Date:         startOfDay,
-			TotalRevenue: totalRevenue,
-			TotalExpense: totalExpense,
-			NetRevenue:   totalRevenue - totalExpense,
+		report = models.DailyReport{
+			TenantID:      tenantID,
+			Date:          startOfDay,
+			TotalOrders:   int(orderCount),
+			TotalRevenue:  totalRevenue,
+			TotalExpenses: totalExpense,
+			NetProfit:     totalRevenue - totalExpense,
 		}
-		h.DB.Create(&revenue)
+		h.db.Create(&report)
 	} else {
-		revenue.TotalRevenue = totalRevenue
-		revenue.TotalExpense = totalExpense
-		revenue.NetRevenue = totalRevenue - totalExpense
-		h.DB.Save(&revenue)
+		report.TotalOrders = int(orderCount)
+		report.TotalRevenue = totalRevenue
+		report.TotalExpenses = totalExpense
+		report.NetProfit = totalRevenue - totalExpense
+		h.db.Save(&report)
 	}
 }
