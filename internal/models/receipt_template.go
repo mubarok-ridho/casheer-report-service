@@ -25,6 +25,11 @@ type ReceiptTemplate struct {
 	CharactersPerLine int    `json:"characters_per_line" gorm:"default:32"`
 
 	// Settings
+	LogoPosition   string `json:"logo_position" gorm:"default:'center'"`
+	MarginTop      int    `json:"margin_top" gorm:"default:0"`
+	MarginBottom   int    `json:"margin_bottom" gorm:"default:0"`
+	ShowVariations bool   `json:"show_variations" gorm:"default:true"`
+	ShowNotes      bool   `json:"show_notes" gorm:"default:true"`
 	IsDefault bool           `json:"is_default" gorm:"default:false"`
 	IsActive  bool           `json:"is_active" gorm:"default:true"`
 	CreatedAt time.Time      `json:"created_at"`

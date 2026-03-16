@@ -54,7 +54,6 @@ func main() {
 
 	// Initialize repositories
 	expenseRepo := repository.NewExpenseRepository(db)
-	reportRepo := repository.NewReportRepository(db)
 	templateRepo := repository.NewTemplateRepository(db)
 
 	// Initialize handlers

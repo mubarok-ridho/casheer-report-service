@@ -75,7 +75,7 @@ func (h *ReportHandler) GetDailyReport(c *fiber.Ctx) error {
 	if dateStr == "" {
 		date = time.Now()
 	} else {
-		date, err = time.Parse("2006-01-02", dateStr)
+		date, err = time.ParseInLocation("2006-01-02", dateStr, time.Local)
 		if err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid date format. Use YYYY-MM-DD"})
 		}

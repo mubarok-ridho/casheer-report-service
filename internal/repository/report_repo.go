@@ -20,12 +20,71 @@ func (r *ReportRepository) GetDailyReport(tenantID uint, date time.Time) (*model
 	var report models.DailyReport
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 
-	err := r.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).First(&report).Error
-	if err != nil {
-		// If not found, calculate on the fly
-		return r.calculateDailyReport(tenantID, date)
+	r.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).First(&report)
+	// Always delete stale cache and recalculate
+	r.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).Delete(&models.DailyReport{})
+	return r.calculateDailyReport(tenantID, date)
+}
+
+// calculateDailyReport - query directly from orders table
+func (r *ReportRepository) calculateDailyReport(tenantID uint, date time.Time) (*models.DailyReport, error) {
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+	endOfDay := startOfDay.Add(24 * time.Hour)
+
+	var revenue float64
+	var orderCount int64
+	r.DB.Raw("SELECT COALESCE(SUM(total_amount), 0), COUNT(*) FROM orders WHERE tenant_id = ? AND payment_status = 'paid' AND created_at BETWEEN ? AND ?",
+		tenantID, startOfDay, endOfDay).Row().Scan(&revenue, &orderCount)
+
+	var expense float64
+	r.DB.Raw("SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE tenant_id = ? AND date::date = ?::date",
+		tenantID, startOfDay).Row().Scan(&expense)
+
+	type PaymentRow struct {
+		Method string
+		Total  float64
 	}
-	return &report, nil
+	var paymentRows []PaymentRow
+	r.DB.Raw("SELECT payment_method as method, COALESCE(SUM(total_amount), 0) as total FROM orders WHERE tenant_id = ? AND payment_status = 'paid' AND created_at BETWEEN ? AND ? GROUP BY payment_method",
+		tenantID, startOfDay, endOfDay).Scan(&paymentRows)
+	paymentSummary := models.JSONMap{}
+	for _, p := range paymentRows {
+		paymentSummary[p.Method] = p.Total
+	}
+
+	// Category summary - join orders with order_items and menus
+	type CategoryRow struct {
+		Category string
+		Total    float64
+	}
+	var categoryRows []CategoryRow
+	r.DB.Raw(`SELECT c.name as category, COALESCE(SUM(oi.subtotal), 0) as total
+		FROM order_items oi
+		JOIN orders o ON o.id = oi.order_id
+		JOIN menus m ON m.id = oi.menu_id
+		JOIN categories c ON c.id = m.category_id
+		WHERE o.tenant_id = ? AND o.payment_status = 'paid' AND o.created_at BETWEEN ? AND ?
+		GROUP BY c.name`,
+		tenantID, startOfDay, endOfDay).Scan(&categoryRows)
+	categorySummary := models.JSONMap{}
+	for _, c := range categoryRows {
+		categorySummary[c.Category] = c.Total
+	}
+
+	report := &models.DailyReport{
+		TenantID:        tenantID,
+		Date:            startOfDay,
+		TotalOrders:     int(orderCount),
+		TotalRevenue:    revenue,
+		TotalExpenses:   expense,
+		NetProfit:       revenue - expense,
+		PaymentSummary:  paymentSummary,
+		CategorySummary: categorySummary,
+	}
+	// Delete old cached record and save fresh data
+	r.DB.Where("tenant_id = ? AND date = ?", tenantID, startOfDay).Delete(&models.DailyReport{})
+	r.DB.Create(report)
+	return report, nil
 }
 
 // Get monthly report
@@ -123,10 +182,23 @@ func (r *ReportRepository) GetRevenueSummary(tenantID uint, days int) (map[strin
 	endDate := time.Now()
 	startDate := endDate.AddDate(0, 0, -days)
 
-	var revenues []models.Revenue
-	err := r.DB.Where("tenant_id = ? AND date BETWEEN ? AND ?", tenantID, startDate, endDate).
-		Order("date asc").
-		Find(&revenues).Error
+	type DailyRevenue struct {
+		Date    time.Time `gorm:"column:date"`
+		Revenue float64   `gorm:"column:revenue"`
+	}
+
+	var rows []DailyRevenue
+	err := r.DB.Raw(`
+		SELECT
+			DATE(created_at) as date,
+			COALESCE(SUM(total_amount), 0) as revenue
+		FROM orders
+		WHERE tenant_id = ?
+		  AND payment_status = 'paid'
+		  AND created_at BETWEEN ? AND ?
+		GROUP BY DATE(created_at)
+		ORDER BY date ASC
+	`, tenantID, startDate, endDate).Scan(&rows).Error
 
 	if err != nil {
 		return nil, err
@@ -134,18 +206,17 @@ func (r *ReportRepository) GetRevenueSummary(tenantID uint, days int) (map[strin
 
 	var total float64
 	var data []map[string]interface{}
-
-	for _, r := range revenues {
-		total += r.TotalRevenue
+	for _, row := range rows {
+		total += row.Revenue
 		data = append(data, map[string]interface{}{
-			"date":    r.Date.Format("2006-01-02"),
-			"revenue": r.TotalRevenue,
+			"date":    row.Date.Format("2006-01-02"),
+			"revenue": row.Revenue,
 		})
 	}
 
-	average := total / float64(len(revenues))
-	if len(revenues) == 0 {
-		average = 0
+	average := float64(0)
+	if len(rows) > 0 {
+		average = total / float64(len(rows))
 	}
 
 	return map[string]interface{}{
@@ -191,41 +262,4 @@ func (r *ReportRepository) GetExpenseSummary(tenantID uint, days int) (map[strin
 		"by_category": byCategory,
 		"days":        days,
 	}, nil
-}
-
-// calculateDailyReport - internal function to calculate report on the fly
-func (r *ReportRepository) calculateDailyReport(tenantID uint, date time.Time) (*models.DailyReport, error) {
-	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
-	endOfDay := startOfDay.Add(24 * time.Hour)
-
-	// Get revenue from events
-	var revenue float64
-	var orderCount int64
-	r.DB.Model(&models.RevenueEvent{}).
-		Where("tenant_id = ? AND type = 'order' AND date BETWEEN ? AND ?",
-			tenantID, startOfDay, endOfDay).
-		Select("COALESCE(SUM(amount), 0), COUNT(*)").
-		Row().Scan(&revenue, &orderCount)
-
-	// Get expenses
-	var expense float64
-	var expenseCount int64
-	r.DB.Model(&models.Expense{}).
-		Where("tenant_id = ? AND date BETWEEN ? AND ?", tenantID, startOfDay, endOfDay).
-		Select("COALESCE(SUM(amount), 0), COUNT(*)").
-		Row().Scan(&expense, &expenseCount)
-
-	report := &models.DailyReport{
-		TenantID:      tenantID,
-		Date:          startOfDay,
-		TotalOrders:   int(orderCount),
-		TotalRevenue:  revenue,
-		TotalExpenses: expense,
-		NetProfit:     revenue - expense,
-	}
-
-	// Save to database
-	r.DB.Create(report)
-
-	return report, nil
 }
