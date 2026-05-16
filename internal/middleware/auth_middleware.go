@@ -29,7 +29,11 @@ func AuthMiddleware() fiber.Handler {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fiber.ErrUnauthorized
 			}
-			return []byte("your-secret-key"), nil
+			secret := os.Getenv("JWT_SECRET")
+                        if secret == "" {
+                                secret = "your-super-secret-jwt-key-change-this-in-production"
+                        }
+                        return []byte(secret), nil
 		})
 
 		if err != nil || !token.Valid {
